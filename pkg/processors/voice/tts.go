@@ -2,10 +2,13 @@ package voice
 
 import (
 	"context"
+	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
+	"github.com/Voxray-AI/Voxray/pkg/captions"
 	"github.com/Voxray-AI/Voxray/pkg/frames"
 	"github.com/Voxray-AI/Voxray/pkg/logger"
 	"github.com/Voxray-AI/Voxray/pkg/metrics"
@@ -21,6 +24,11 @@ const minBatchRunes = 30 // don't flush tiny fragments; wait for at least this m
 // TTSProcessor turns LLMTextFrame, TextFrame, or TTSSpeakFrame into TTSAudioRawFrame using a TTSService.
 // It batches streamed LLM text by sentence (or MaxBatchRunes) so each TTS API call gets a full phrase, reducing choppy playback.
 // Emits BotStartedSpeakingFrame before the first TTS audio in a response and BotStoppedSpeakingFrame after each segment for observers.
+//
+// Each speak batch is tagged with caption metadata (captions.MetadataKey*) on
+// its audio frames so a downstream captions.CaptionProcessor can emit real-time
+// caption events aligned to the delivered audio. The tags live in frame
+// metadata and are not part of the JSON/protobuf audio wire payload.
 type TTSProcessor struct {
 	*processors.BaseProcessor
 	TTS           services.TTSService
@@ -29,6 +37,10 @@ type TTSProcessor struct {
 	buf           strings.Builder
 	botSpeaking   bool // true after we've pushed BotStartedSpeakingFrame this turn; reset on UserStartedSpeakingFrame/StartFrame
 }
+
+// captionSegmentCounter guarantees unique segment ids within one TTS processor
+// (one segment per Speak call) even across barge-in and pipeline restarts.
+var captionSegmentCounter uint64
 
 // NewTTSProcessor returns a processor that speaks text and pushes TTSAudioRawFrame(s) downstream.
 func NewTTSProcessor(name string, tts services.TTSService, sampleRate int) *TTSProcessor {
@@ -141,7 +153,40 @@ func (p *TTSProcessor) speak(ctx context.Context, text string) error {
 	}
 	metrics.TTSTimeToFirstAudioChunkSeconds.WithLabelValues("", "tts", "success", "").Observe(latency)
 	metrics.TTSSynthesisLatencySeconds.WithLabelValues("", "tts", "success", "").Observe(latency)
+
+	// Filter out empty audio frames (silence/no payload): they carry no
+	// playback and no caption timing, so forwarding them would only stall the
+	// caption allocator. Non-empty frames get caption segment tags.
+	// A fresh slice (no backing-array aliasing) keeps this safe regardless of
+	// how the TTS provider constructed the input slice.
+	nonEmpty := make([]*frames.TTSAudioRawFrame, 0, len(audioFrames))
+	for _, af := range audioFrames {
+		if af == nil || len(af.Audio) == 0 {
+			logger.Debug("TTS: dropping empty audio frame for text preview=%q", preview)
+			continue
+		}
+		nonEmpty = append(nonEmpty, af)
+	}
+	audioFrames = nonEmpty
+	if len(audioFrames) == 0 {
+		// TTS succeeded syntactically but produced no audible audio. Surface a
+		// non-fatal error so caption/UI layers can withdraw any interim text
+		// instead of waiting forever for audio that will never arrive.
+		logger.Info("TTS: provider returned no audible audio for preview=%q", preview)
+		_ = p.PushDownstream(ctx, frames.NewErrorFrame("tts returned no audio", false, p.Name()))
+		return nil
+	}
+
+	segmentID := "tts-" + strconv.FormatUint(atomic.AddUint64(&captionSegmentCounter, 1), 10)
 	for i, af := range audioFrames {
+		// Caption correlation tags (internal metadata; never on the wire).
+		af.Metadata()[captions.MetadataKeySegmentID] = segmentID
+		if i == 0 {
+			af.Metadata()[captions.MetadataKeyText] = text
+		}
+		if i == len(audioFrames)-1 {
+			af.Metadata()[captions.MetadataKeySegmentEnd] = true
+		}
 		if !p.botSpeaking {
 			p.botSpeaking = true
 			_ = p.PushDownstream(ctx, frames.NewBotStartedSpeakingFrame())

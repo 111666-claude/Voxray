@@ -67,6 +67,7 @@ graph TD
 | `InputDTMFFrame`, `OutputDTMFUrgentFrame` | struct/func | DTMF I/O |
 | `RTVIClientMessageFrame`, `RTVIServerMessageFrame` | struct | RTVI protocol |
 | `InterruptionFrame`, `NewInterruptionFrame` | struct/func | Barge-in clear |
+| `CaptionFrame`, `NewCaptionFrame` | struct/func | Real-time assistant captions (started/delta/finalized/retracted/error/reset); see [../../docs/CAPTIONS.md](../../docs/CAPTIONS.md) |
 | Service switcher, transport message, etc. | struct/func | See frames.go, llm.go |
 
 ## Subpackage serialize

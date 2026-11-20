@@ -142,3 +142,64 @@ func TestDecodeByType_UnknownType(t *testing.T) {
 		t.Error("DecodeByType(unknown type) should return error")
 	}
 }
+
+// TestCaptionFrameJSONRoundTrip verifies every caption event type survives the
+// JSON envelope wire format with session, sequence and timing fields intact.
+func TestCaptionFrameJSONRoundTrip(t *testing.T) {
+	cases := []struct {
+		event string
+		text  string
+		final bool
+	}{
+		{frames.CaptionEventStarted, "full interim sentence", false},
+		{frames.CaptionEventDelta, "partial ", false},
+		{frames.CaptionEventFinalized, "played words", true},
+		{frames.CaptionEventRetracted, "unplayed suffix", true},
+		{frames.CaptionEventError, "tts unavailable", true},
+		{frames.CaptionEventReset, "", true},
+	}
+	for _, tc := range cases {
+		f := frames.NewCaptionFrame("sess-42", "tts-7", 99, tc.event, tc.text)
+		f.PlayedText = "played "
+		f.StartTime = 1_700_000_000_000_000_000
+		f.EndTime = 1_700_000_000_500_000_000
+		f.AudioFrameID = 555
+		f.Final = tc.final
+
+		data, err := serialize.Encoder(f)
+		if err != nil {
+			t.Fatalf("%s: Encoder: %v", tc.event, err)
+		}
+		decoded, err := serialize.Decoder(data)
+		if err != nil {
+			t.Fatalf("%s: Decoder: %v", tc.event, err)
+		}
+		cf, ok := decoded.(*frames.CaptionFrame)
+		if !ok {
+			t.Fatalf("%s: expected *CaptionFrame, got %T", tc.event, decoded)
+		}
+		if cf.SessionID != "sess-42" || cf.SegmentID != "tts-7" || cf.Seq != 99 {
+			t.Fatalf("%s: identity fields lost: %+v", tc.event, cf)
+		}
+		if cf.Event != tc.event || cf.Text != tc.text || cf.Final != tc.final {
+			t.Fatalf("%s: payload mismatch: %+v", tc.event, cf)
+		}
+		if cf.StartTime != f.StartTime || cf.EndTime != f.EndTime || cf.AudioFrameID != 555 {
+			t.Fatalf("%s: timing fields lost: %+v", tc.event, cf)
+		}
+	}
+}
+
+// TestCaptionFrameSkippedByProtobuf ensures the binary protobuf path skips
+// caption frames gracefully (captions travel over JSON, never breaking the
+// shared binary audio wire format).
+func TestCaptionFrameSkippedByProtobuf(t *testing.T) {
+	f := frames.NewCaptionFrame("s", "seg", 1, frames.CaptionEventDelta, "x")
+	data, err := serialize.ProtoEncode(f)
+	if err != nil {
+		t.Fatalf("ProtoEncode: %v", err)
+	}
+	if data != nil {
+		t.Fatalf("caption frames must be skipped by protobuf, got %d bytes", len(data))
+	}
+}

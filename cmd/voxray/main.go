@@ -22,6 +22,7 @@ import (
 	audiointerruptions "github.com/Voxray-AI/Voxray/pkg/audio/interruptions"
 	"github.com/Voxray-AI/Voxray/pkg/audio/turn"
 	"github.com/Voxray-AI/Voxray/pkg/audio/vad"
+	"github.com/Voxray-AI/Voxray/pkg/captions"
 	"github.com/Voxray-AI/Voxray/pkg/config"
 	"github.com/Voxray-AI/Voxray/pkg/frames"
 	"github.com/Voxray-AI/Voxray/pkg/logger"
@@ -346,6 +347,11 @@ func run(configPath string, flags runFlags) (forced bool, err error) {
 			pl.Add(wrap(voice.NewSTTProcessor("stt", sttSvc, 16000, 1)))
 			pl.Add(wrap(voice.NewLLMProcessorWithSystemPrompt("llm", llm, "You are a helpful voice assistant. Reply briefly and naturally in the same language as the user.")))
 			pl.Add(wrap(voice.NewTTSProcessor("tts", ttsSvc, 24000)))
+
+			// Real-time caption stream: turns TTS audio tags into incremental
+			// CaptionFrame events (started/delta/finalized/retracted/error)
+			// aligned to the audio chunks actually handed to the transport.
+			pl.Add(captions.NewCaptionProcessor("captions", sessionID, nil))
 
 			// Optional interruption controller for barge-in behavior. When
 			// AllowInterruptions is true and a supported strategy is configured,

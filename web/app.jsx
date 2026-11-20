@@ -65,6 +65,8 @@ function App() {
   const [audioLevel, setAudioLevel] = useState(0);
   const [backendUrl] = useState("");
   const [pipelineInfo, setPipelineInfo] = useState(null);
+  const [captions, setCaptions] = useState([]);
+  const [captionNote, setCaptionNote] = useState("");
   const [logLines, setLogLines] = useState([
     "[boot] github.com/Voxray-AI/Voxray v0.4.2 — pipeline runner ready",
     "[boot] transports: ws, webrtc(opus) — cgo enabled",
@@ -72,6 +74,27 @@ function App() {
 
   const sessionStartRef = useRef(null);
   const canvasRef = useRef(null);
+  const captionStoreRef = useRef(null);
+
+  // Real-time caption store: started/delta/finalized/retracted/error/reset.
+  // The store is framework-agnostic (web/captions.js); here we mirror its
+  // snapshot into React state. Barge-in retractions remove the un-played
+  // suffix inside the store, so no half-sentence ever reaches the UI.
+  useEffect(() => {
+    if (!globalThis.VoxrayCaptions) return undefined;
+    captionStoreRef.current = globalThis.VoxrayCaptions.createCaptionStore({
+      onChange: (snap) => setCaptions(snap),
+      onError: (msg) => {
+        setCaptionNote(`TTS error: ${msg}`);
+        setTimeout(() => setCaptionNote(""), 4000);
+      },
+      onGap: () => {
+        setCaptionNote("Caption gap after reconnect — transcript boundary");
+        setTimeout(() => setCaptionNote(""), 4000);
+      },
+    });
+    return () => { captionStoreRef.current = null; };
+  }, []);
 
   // WebRTC refs — kept as refs so async callbacks always see the latest value
   const pcRef = useRef(null);
@@ -157,6 +180,8 @@ function App() {
     setSessionMs(0);
     sessionStartRef.current = null;
     setAudioLevel(0);
+    setCaptions([]);
+    if (captionStoreRef.current) captionStoreRef.current.reset();
     pushLog("Peer connection closed. Bye.");
   }, [pushLog]);
 
@@ -454,6 +479,8 @@ function App() {
           canvasRef={canvasRef}
           audioLevel={audioLevel}
           pipelineInfo={pipelineInfo}
+          captions={captions}
+          captionNote={captionNote}
         />
       </main>
 
@@ -527,7 +554,7 @@ function Wordmark() {
 }
 
 // ─── Left stage (hero + mic + waveform) ──────────────────────────────────────
-function LeftStage({ theme, accent, state, isConnected, isBusy, stateLabel, connect, disconnect, canvasRef, audioLevel, pipelineInfo }) {
+function LeftStage({ theme, accent, state, isConnected, isBusy, stateLabel, connect, disconnect, canvasRef, audioLevel, pipelineInfo, captions, captionNote }) {
   return (
     <section style={{
       padding: "var(--pad)",
@@ -602,6 +629,10 @@ function LeftStage({ theme, accent, state, isConnected, isBusy, stateLabel, conn
             <span>0 db</span>
           </div>
         </div>
+
+        {/* Real-time caption stream — finalized lines stay, interim text
+            updates live, barge-in retractions never leave a half-sentence. */}
+        <CaptionStrip theme={theme} accent={accent} captions={captions} note={captionNote} isConnected={isConnected} />
       </div>
 
       {/* Quick stats row */}
@@ -618,6 +649,71 @@ function LeftStage({ theme, accent, state, isConnected, isBusy, stateLabel, conn
         <Stat kpi="∞" label="Sessions / process" theme={theme} sub="Worker pool" />
       </div>
     </section>
+  );
+}
+
+// ─── Real-time caption strip ─────────────────────────────────────────────────
+// Renders the caption store snapshot. Finalized segments are solid; the live
+// interim segment pulses; retracted/error states are styled distinctly. The
+// store guarantees barge-in never leaves an un-played half-sentence.
+function CaptionStrip({ theme, accent, captions, note, isConnected }) {
+  const recent = (captions || []).slice(-4);
+  return (
+    <div style={{
+      border: `1px solid ${theme.line}`,
+      borderRadius: 12,
+      background: theme.panel,
+      padding: "16px 18px",
+      minHeight: 118,
+      display: "flex",
+      flexDirection: "column",
+      gap: 8,
+    }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <div style={{ ...mono(10.5), color: "var(--dim)", letterSpacing: "0.16em", textTransform: "uppercase" }}>
+          <span style={{ color: accent }}>●</span>&nbsp;&nbsp;Live captions · assistant
+        </div>
+        <div style={{ ...mono(10), color: "var(--dim2)", letterSpacing: "0.08em" }}>
+          {isConnected ? "streaming · seq-aligned to audio" : "standby"}
+        </div>
+      </div>
+
+      <div style={{ display: "flex", flexDirection: "column", gap: 6, overflowY: "auto" }}>
+        {recent.length === 0 && (
+          <div style={{ ...mono(12), color: "var(--dim2)" }}>
+            {isConnected ? "Listening for assistant speech…" : "Captions appear here during a session."}
+          </div>
+        )}
+        {recent.map((c) => {
+          const isInterim = c.status === "interim";
+          const isError = c.status === "error";
+          return (
+            <div key={c.segmentId} style={{ display: "flex", gap: 10, alignItems: "baseline" }}>
+              <span style={{
+                flex: "0 0 auto", ...mono(9.5), letterSpacing: "0.12em",
+                color: isInterim ? accent : "var(--dim2)",
+                textTransform: "uppercase",
+              }}>
+                {isInterim ? "live" : isError ? "error" : "final"}
+              </span>
+              <span style={{
+                fontSize: 15,
+                lineHeight: 1.45,
+                color: isInterim ? "var(--text)" : "var(--dim)",
+                opacity: isInterim ? 0.92 : 1,
+                fontStyle: isInterim ? "normal" : "normal",
+              }}>
+                {c.text || (isInterim ? "…" : "")}
+              </span>
+            </div>
+          );
+        })}
+      </div>
+
+      {note && (
+        <div style={{ ...mono(10.5), color: "#F0B83A", letterSpacing: "0.04em" }}>{note}</div>
+      )}
+    </div>
   );
 }
 

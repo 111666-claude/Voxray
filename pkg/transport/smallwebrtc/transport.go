@@ -319,8 +319,10 @@ var outboundEncoderAvailable bool
 // It is false when built without cgo (Opus encoder unavailable); in that case HandleOffer still succeeds but TTS is drained locally.
 func OutboundEncoderAvailable() bool { return outboundEncoderAvailable }
 
-// drainTTSFramesUntilNonTTS reads from outCh and discards TTSAudioRawFrame (and duplicate UserStartedSpeakingFrame).
-// Returns the first non-TTS frame so the caller can process it; returns nil if channel closed or closed signal.
+// drainTTSFramesUntilNonTTS reads from outCh and discards TTSAudioRawFrame,
+// caption frames (they only annotate the drained audio), and duplicate
+// UserStartedSpeakingFrame. Returns the first frame that must still be
+// processed; returns nil if channel closed or closed signal.
 func drainTTSFramesUntilNonTTS(outCh <-chan frames.Frame, closed <-chan struct{}) frames.Frame {
 	for {
 		select {
@@ -331,6 +333,15 @@ func drainTTSFramesUntilNonTTS(outCh <-chan frames.Frame, closed <-chan struct{}
 				return nil
 			}
 			if _, isTTS := f.(*frames.TTSAudioRawFrame); isTTS {
+				continue
+			}
+			if _, isCaption := f.(*frames.CaptionFrame); isCaption {
+				continue
+			}
+			if _, isBot := f.(*frames.BotStartedSpeakingFrame); isBot {
+				continue
+			}
+			if _, isBot := f.(*frames.BotStoppedSpeakingFrame); isBot {
 				continue
 			}
 			if _, isBargeIn := f.(*frames.UserStartedSpeakingFrame); isBargeIn {

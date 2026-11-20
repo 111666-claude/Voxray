@@ -210,6 +210,13 @@ func DecodeByType(typ string, data []byte) (frames.Frame, error) {
 			return nil, err
 		}
 		return &f, nil
+	case "CaptionFrame":
+		var f frames.CaptionFrame
+		f.ControlFrame.Base = frames.NewBase()
+		if err := json.Unmarshal(data, &f); err != nil {
+			return nil, err
+		}
+		return &f, nil
 	case "InputDTMFFrame":
 		var f frames.InputDTMFFrame
 		f.ControlFrame.Base = frames.NewBase()

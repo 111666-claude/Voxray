@@ -45,21 +45,83 @@ func (s *Source) Run(ctx context.Context) {
 }
 
 // Sink is a processor that forwards all frames to a channel (for transport output).
+//
+// ORDERING: frames are handed to a single writer goroutine through an internal
+// bounded queue, so the order in which frames reach the transport output
+// channel exactly matches the pipeline's downstream order. This matters for
+// caption events, which must stay aligned with their audio chunks. The queue
+// decouples the pipeline from a slow transport (the writer blocks on the
+// transport, not the processor) while bounding buffering: when the queue is
+// full the pipeline applies back-pressure instead of spawning unbounded
+// goroutines.
 type Sink struct {
 	*processors.BaseProcessor
 	Out        chan<- frames.Frame
 	ttsLogOnce sync.Once
+
+	queue   chan frames.Frame
+	started bool
+	closed  bool
+	startMu sync.Mutex
+	done    chan struct{}
 }
+
+// sinkQueueCap bounds the in-process frame backlog between the pipeline and
+// the transport writer. It mirrors the runner's input-queue philosophy: large
+// enough to absorb transport jitter, small enough to avoid unbounded memory.
+const sinkQueueCap = 256
 
 // NewSink returns a Sink that writes to ch.
 func NewSink(name string, ch chan<- frames.Frame) *Sink {
 	if name == "" {
 		name = "Sink"
 	}
-	return &Sink{BaseProcessor: processors.NewBaseProcessor(name), Out: ch}
+	return &Sink{
+		BaseProcessor: processors.NewBaseProcessor(name),
+		Out:           ch,
+		queue:         make(chan frames.Frame, sinkQueueCap),
+		done:          make(chan struct{}),
+	}
 }
 
-// ProcessFrame forwards the frame to Out and does not call next (end of chain).
+// ensureWriter starts the single ordered writer goroutine once. The writer
+// drains the internal queue into Out in FIFO order until the queue is closed
+// (Cleanup) or the context is canceled.
+func (s *Sink) ensureWriter(ctx context.Context) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	if s.started {
+		return
+	}
+	s.started = true
+	go func() {
+		defer close(s.done)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case frame, ok := <-s.queue:
+				if !ok {
+					return
+				}
+				// A single goroutine performs all sends, so transport ordering
+				// matches pipeline ordering even with a slow client. The
+				// transport may close its output channel during shutdown; the
+				// recover keeps that race from crashing the process.
+				func() {
+					defer func() { _ = recover() }()
+					select {
+					case s.Out <- frame:
+					case <-ctx.Done():
+					}
+				}()
+			}
+		}
+	}()
+}
+
+// ProcessFrame forwards the frame to the transport via the ordered queue and
+// does not call next (end of chain).
 func (s *Sink) ProcessFrame(ctx context.Context, f frames.Frame, dir processors.Direction) error {
 	if dir != processors.Downstream {
 		if s.Prev() != nil {
@@ -74,21 +136,41 @@ func (s *Sink) ProcessFrame(ctx context.Context, f frames.Frame, dir processors.
 			logger.Info("pipeline (sink): forwarding to transport frame type=%s id=%d", f.FrameType(), f.ID())
 		}
 	}
-	if s.Out != nil && f != nil {
-		// Send in a goroutine so the pipeline never blocks on a slow transport.
-		// This allows the runner's worker to keep processing queued mic input while TTS
-		// frames are still being sent to the client; order is preserved by the channel.
-		out := s.Out
-		frame := f
-		go func() {
-			defer func() { _ = recover() }() // avoid panic if channel closed during shutdown
-			select {
-			case out <- frame:
-			case <-ctx.Done():
-			}
-		}()
+	if s.Out == nil || f == nil {
+		return nil
+	}
+	s.ensureWriter(ctx)
+	// Enqueue in pipeline order. Back-pressure: a slow transport eventually
+	// fills the queue and the pipeline blocks here rather than dropping or
+	// reordering frames. A closed queue (after Cleanup) means teardown is in
+	// progress; recover and drop rather than panic.
+	defer func() { _ = recover() }()
+	select {
+	case s.queue <- f:
+	case <-ctx.Done():
 	}
 	return nil
+}
+
+// Cleanup stops the ordered writer. It is idempotent: concurrent or repeated
+// calls after the first are no-ops. Queued frames are delivered best-effort
+// until the context is canceled.
+func (s *Sink) Cleanup(ctx context.Context) error {
+	s.startMu.Lock()
+	started := s.started
+	if !s.closed {
+		s.closed = true
+		close(s.queue)
+	}
+	s.startMu.Unlock()
+	if !started {
+		return nil
+	}
+	select {
+	case <-s.done:
+	case <-ctx.Done():
+	}
+	return s.BaseProcessor.Cleanup(ctx)
 }
 
 // PipelineSource is a processor that acts as the entry point of a pipeline; it forwards
